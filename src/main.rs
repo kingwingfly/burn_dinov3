@@ -1,8 +1,8 @@
-use burn::{Tensor, backend::Wgpu};
+use burn::{Tensor, backend::Cuda};
 use burn_store::{ModuleSnapshot, PytorchStore};
 use dino::model::{DinoVisionTransformer, vit_small};
 
-type Backend = Wgpu;
+type Backend = Cuda;
 
 fn main() {
     let device = Default::default();

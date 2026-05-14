@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-burn = { version = "0.21.0", features = ["wgpu"] }
+burn = { version = "0.21.0", features = ["cuda"] }
 burn-store = "0.21.0"
