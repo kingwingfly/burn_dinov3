@@ -5,8 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-burn = "0.21.0"
-tokio = { version = "1.52.3", features = ["full"] }
-
-[build-dependencies]
-burn-onnx = "0.21.0"
+burn = { version = "0.21.0", features = ["wgpu"] }
+burn-store = "0.21.0"
