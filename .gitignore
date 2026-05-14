@@ -2,6 +2,7 @@
 
 *.pth
 *.onnx
+*.onnx_data
 
 .venv
 .ruff_cache

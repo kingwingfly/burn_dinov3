@@ -1,9 +1,6 @@
-You can download `.pth` following facebook [DINOv3 repo](https://github.com/facebookresearch/dinov3).
-
-And put them in `./models`.
-
-Then convert the `.pth` model to `.onnx`:
+Download pretrained model.
 ```sh
-cd pth2onnx
-uv run main.py
+mkdir models
+wget -O models/model.onnx https://huggingface.co/onnx-community/dinov3-vits16-pretrain-lvd1689m-ONNX/resolve/main/onnx/model.onnx
+wget -O models/model.onnx_data https://huggingface.co/onnx-community/dinov3-vits16-pretrain-lvd1689m-ONNX/resolve/main/onnx/model.onnx_data
 ```
