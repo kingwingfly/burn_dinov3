@@ -9,9 +9,9 @@ use burn::{
 
 #[derive(Module, Debug)]
 pub struct PatchEmbed<B: Backend> {
-    proj: Conv2d<B>,
-    patch_size: usize,
-    embed_dim: usize,
+    pub proj: Conv2d<B>,
+    pub patch_size: usize,
+    pub embed_dim: usize,
 }
 
 impl<B: Backend> PatchEmbed<B> {
@@ -40,8 +40,8 @@ impl<B: Backend> PatchEmbed<B> {
 
 #[derive(Module, Debug)]
 pub struct RopePositionEmbedding<B: Backend> {
-    periods: Tensor<B, 1>,
-    d_head: usize,
+    pub periods: Tensor<B, 1>,
+    pub d_head: usize,
 }
 
 impl<B: Backend> RopePositionEmbedding<B> {
@@ -75,8 +75,8 @@ impl<B: Backend> RopePositionEmbedding<B> {
 
 #[derive(Module, Debug)]
 pub struct LinearKMaskedBias<B: Backend> {
-    linear: Linear<B>,
-    bias_mask: Param<Tensor<B, 1>>,
+    pub linear: Linear<B>,
+    pub bias_mask: Param<Tensor<B, 1>>,
 }
 
 impl<B: Backend> LinearKMaskedBias<B> {
@@ -93,7 +93,7 @@ impl<B: Backend> LinearKMaskedBias<B> {
 
 #[derive(Module, Debug)]
 pub struct LayerScale<B: Backend> {
-    gamma: Param<Tensor<B, 1>>,
+    pub gamma: Param<Tensor<B, 1>>,
 }
 
 impl<B: Backend> LayerScale<B> {
@@ -103,38 +103,28 @@ impl<B: Backend> LayerScale<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.gamma.val().reshape([1, 1, x.shape()[2]]) * x
+        let dim = x.shape()[2];
+        x * self.gamma.val().reshape([1, 1, dim])
     }
 }
 
 #[derive(Module, Debug)]
 pub struct Attention<B: Backend> {
-    qkv: LinearKMaskedBias<B>,
-    proj: Linear<B>,
-    drop_out: Dropout,
-    num_heads: usize,
+    pub qkv: LinearKMaskedBias<B>,
+    pub proj: Linear<B>,
+    pub drop_out: Dropout,
+    pub num_heads: usize,
 }
 
 impl<B: Backend> Attention<B> {
-    pub fn new(
-        dim: usize,
-        drop_out: f64,
-        num_heads: usize,
-        qkv_bias: bool,
-        proj_bias: bool,
-        device: &B::Device,
-    ) -> Self {
+    pub fn new(dim: usize, num_heads: usize, device: &B::Device) -> Self {
         Self {
             qkv: LinearKMaskedBias {
-                linear: LinearConfig::new(dim, dim * 3)
-                    .with_bias(qkv_bias)
-                    .init(device),
+                linear: LinearConfig::new(dim, dim * 3).with_bias(true).init(device),
                 bias_mask: Param::from_tensor(Tensor::zeros([dim * 3], device)),
             },
-            proj: LinearConfig::new(dim, dim)
-                .with_bias(proj_bias)
-                .init(device),
-            drop_out: DropoutConfig::new(drop_out).init(),
+            proj: LinearConfig::new(dim, dim).with_bias(true).init(device),
+            drop_out: DropoutConfig::new(0.0).init(),
             num_heads,
         }
     }
@@ -162,9 +152,9 @@ impl<B: Backend> Attention<B> {
 
 #[derive(Module, Debug)]
 pub struct Mlp<B: Backend> {
-    fc1: Linear<B>,
-    act: Gelu,
-    fc2: Linear<B>,
+    pub fc1: Linear<B>,
+    pub act: Gelu,
+    pub fc2: Linear<B>,
 }
 
 impl<B: Backend> Mlp<B> {
@@ -185,26 +175,20 @@ impl<B: Backend> Mlp<B> {
 
 #[derive(Module, Debug)]
 pub struct Block<B: Backend> {
-    norm1: LayerNorm<B>,
-    attn: Attention<B>,
-    ls1: LayerScale<B>,
-    norm2: LayerNorm<B>,
-    mlp: Mlp<B>,
-    ls2: LayerScale<B>,
+    pub norm1: LayerNorm<B>,
+    pub attn: Attention<B>,
+    pub ls1: LayerScale<B>,
+    pub norm2: LayerNorm<B>,
+    pub mlp: Mlp<B>,
+    pub ls2: LayerScale<B>,
 }
 
 impl<B: Backend> Block<B> {
-    pub fn new(
-        dim: usize,
-        drop_out: f64,
-        num_heads: usize,
-        ffn_ratio: f64,
-        device: &B::Device,
-    ) -> Self {
+    pub fn new(dim: usize, num_heads: usize, ffn_ratio: f64, device: &B::Device) -> Self {
         let hidden_dim = (dim as f64 * ffn_ratio) as usize;
         Self {
             norm1: LayerNormConfig::new(dim).with_bias(true).init(device),
-            attn: Attention::new(dim, drop_out, num_heads, true, true, device),
+            attn: Attention::new(dim, num_heads, device),
             ls1: LayerScale::new(dim, 1e-5, device),
             norm2: LayerNormConfig::new(dim).with_bias(true).init(device),
             mlp: Mlp::new(dim, hidden_dim, device),
@@ -226,11 +210,11 @@ impl<B: Backend> Block<B> {
 
 #[derive(Module, Debug)]
 pub struct DinoVisionTransformer<B: Backend> {
-    patch_embed: PatchEmbed<B>,
-    cls_token: Param<Tensor<B, 3>>,
-    rope_embed: RopePositionEmbedding<B>,
-    blocks: Vec<Block<B>>,
-    norm: LayerNorm<B>,
+    pub patch_embed: PatchEmbed<B>,
+    pub cls_token: Param<Tensor<B, 3>>,
+    pub rope_embed: RopePositionEmbedding<B>,
+    pub blocks: Vec<Block<B>>,
+    pub norm: LayerNorm<B>,
 }
 
 impl<B: Backend> DinoVisionTransformer<B> {
@@ -238,17 +222,17 @@ impl<B: Backend> DinoVisionTransformer<B> {
         patch_size: usize,
         embed_dim: usize,
         depth: usize,
-        drop_out: f64,
         num_heads: usize,
         ffn_ratio: f64,
         device: &B::Device,
     ) -> Self {
         let patch_embed = PatchEmbed::new(3, embed_dim, patch_size, device);
+
         let cls_token = Param::from_tensor(Tensor::zeros([1, 1, embed_dim], device));
 
         let rope_embed = RopePositionEmbedding::new(embed_dim, num_heads, 100.0, device);
 
-        let blocks = vec![Block::new(embed_dim, drop_out, num_heads, ffn_ratio, device); depth];
+        let blocks = vec![Block::new(embed_dim, num_heads, ffn_ratio, device); depth];
 
         let norm = LayerNormConfig::new(embed_dim).init(device);
 
@@ -276,58 +260,30 @@ impl<B: Backend> DinoVisionTransformer<B> {
     }
 }
 
-pub fn vit_small<B: Backend>(
-    patch_size: usize,
-    drop_out: f64,
-    device: &B::Device,
-) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 384, 12, drop_out, 6, 4.0, device)
+pub fn vit_small<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
+    DinoVisionTransformer::new(patch_size, 384, 12, 6, 4.0, device)
 }
 
-pub fn vit_base<B: Backend>(
-    patch_size: usize,
-    drop_out: f64,
-    device: &B::Device,
-) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 768, 12, drop_out, 12, 4.0, device)
+pub fn vit_base<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
+    DinoVisionTransformer::new(patch_size, 768, 12, 12, 4.0, device)
 }
 
-pub fn vit_large<B: Backend>(
-    patch_size: usize,
-    drop_out: f64,
-    device: &B::Device,
-) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 1024, 24, drop_out, 16, 4.0, device)
+pub fn vit_large<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
+    DinoVisionTransformer::new(patch_size, 1024, 24, 16, 4.0, device)
 }
 
-pub fn vit_so400m<B: Backend>(
-    patch_size: usize,
-    drop_out: f64,
-    device: &B::Device,
-) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 1152, 27, drop_out, 18, 3.777777778, device)
+pub fn vit_so400m<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
+    DinoVisionTransformer::new(patch_size, 1152, 27, 18, 3.777777778, device)
 }
 
-pub fn vit_huge2<B: Backend>(
-    patch_size: usize,
-    drop_out: f64,
-    device: &B::Device,
-) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 1280, 32, drop_out, 20, 4.0, device)
+pub fn vit_huge2<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
+    DinoVisionTransformer::new(patch_size, 1280, 32, 20, 4.0, device)
 }
 
-pub fn vit_giant2<B: Backend>(
-    patch_size: usize,
-    drop_out: f64,
-    device: &B::Device,
-) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 1536, 40, drop_out, 24, 4.0, device)
+pub fn vit_giant2<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
+    DinoVisionTransformer::new(patch_size, 1536, 40, 24, 4.0, device)
 }
 
-pub fn vit_7b<B: Backend>(
-    patch_size: usize,
-    drop_out: f64,
-    device: &B::Device,
-) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 4096, 40, drop_out, 32, 3.0, device)
+pub fn vit_7b<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
+    DinoVisionTransformer::new(patch_size, 4096, 40, 32, 3.0, device)
 }

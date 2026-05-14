@@ -1043,6 +1043,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn_dinov3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "burn",
+ "burn-store",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2265,15 +2274,6 @@ dependencies = [
  "crypto-common 0.2.1",
  "ctutils",
  "zeroize",
-]
-
-[[package]]
-name = "dino"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "burn",
- "burn-store",
 ]
 
 [[package]]
