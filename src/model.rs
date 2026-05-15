@@ -135,9 +135,9 @@ pub struct LoRA<B: Backend> {
 pub struct LoRAConfig {
     pub dim: usize,
     pub rank: usize,
-    #[config(default = "Initializer::Zeros")]
-    pub a_initializer: Initializer,
     #[config(default = "Initializer::KaimingUniform{gain:1.0/3.0f64.sqrt(), fan_out_only:false}")]
+    pub a_initializer: Initializer,
+    #[config(default = "Initializer::Zeros")]
     pub b_initializer: Initializer,
 }
 
