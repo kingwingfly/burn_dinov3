@@ -21,5 +21,5 @@ fn main() {
 
     dbg!(res);
 
-    dbg!(dino.forward(Tensor::zeros([1, 3, 256, 256], &device)));
+    dbg!(dino.forward(Tensor::zeros([1, 3, 256, 256], &device), None));
 }
