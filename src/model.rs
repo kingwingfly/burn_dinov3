@@ -1,7 +1,9 @@
 use burn::{
+    config::Config,
     module::{Module, Param},
     nn::{
-        Dropout, DropoutConfig, Gelu, LayerNorm, LayerNormConfig, Linear, LinearConfig,
+        Dropout, DropoutConfig, Gelu, Initializer, LayerNorm, LayerNormConfig, Linear,
+        LinearConfig,
         conv::{Conv2d, Conv2dConfig},
     },
     tensor::{Bool, FloatDType, Tensor, backend::Backend, module, ops::AttentionModuleOptions},
@@ -27,10 +29,9 @@ impl<B: Backend> PatchEmbed<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> (Tensor<B, 3>, usize, usize) {
-        let [batch_size, _, height, width] = x.dims();
-        let (height, width) = (height / self.patch_size, width / self.patch_size);
         let x = self.proj.forward(x);
-        let x = x.reshape([batch_size, self.embed_dim, height * width]);
+        let [_, _, height, width] = x.dims();
+        let x = x.flatten(2, -1);
         (x.swap_dims(1, 2), height, width)
     }
 }
@@ -57,30 +58,30 @@ impl<B: Backend> RopePositionEmbedding<B> {
 
     pub fn forward(&self, height: usize, width: usize) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let device = self.periods.device();
-        let hw = height * width;
 
         let coords_h = (Tensor::arange(0..height as i64, &device).float() + 0.5) / (height as f32);
         let coords_w = (Tensor::arange(0..width as i64, &device).float() + 0.5) / (width as f32);
 
         let ch = coords_h
-            .reshape([height, 1])
-            .repeat_dim(1, width)
-            .reshape([hw, 1]);
+            .unsqueeze_dim::<2>(1) // [h, 1]
+            .repeat_dim(1, width) // [h, w]
+            .reshape([-1, 1]); // [hw, 1]
         let cw = coords_w
-            .reshape([1, width])
-            .repeat_dim(0, height)
-            .reshape([hw, 1]);
-        let mut coords = Tensor::cat(vec![ch, cw], 1);
+            .unsqueeze::<2>() // [1, w]
+            .repeat_dim(0, height) // [h, w]
+            .reshape([-1, 1]); // [hw, 1]
+        let mut coords = Tensor::cat(vec![ch, cw], 1); // [hw, 2]
         coords = coords * 2.0 - 1.0;
 
-        let angles = coords.reshape([hw, 2, 1]) * std::f64::consts::PI * 2.0
+        // [hw, 2, 1] / [1, 1, d_head/4] -> [hw, 2, d_head/4]
+        let angles = coords.unsqueeze_dim::<3>(2) * std::f64::consts::PI * 2.0
             / self
                 .periods
                 .val()
                 .cast(FloatDType::F32) // After loaded from facebook pth, it's BF16
-                .reshape([1, 1, self.periods.dims()[0]]);
-        let angles = angles.reshape([hw, 2 * self.periods.dims()[0]]);
-        let angles_tiled = Tensor::cat(vec![angles.clone(), angles], 1);
+                .unsqueeze::<3>();
+        let angles = angles.flatten(1, 2); // [hw, d_head/2]
+        let angles_tiled = Tensor::cat(vec![angles.clone(), angles], 1); // [hw, d_head]
 
         let sin = angles_tiled.clone().sin();
         let cos = angles_tiled.cos();
@@ -125,10 +126,47 @@ impl<B: Backend> LayerScale<B> {
 }
 
 #[derive(Module, Debug)]
+pub struct LoRA<B: Backend> {
+    pub a: Param<Tensor<B, 2>>,
+    pub b: Param<Tensor<B, 2>>,
+}
+
+#[derive(Config, Debug)]
+pub struct LoRAConfig {
+    pub dim: usize,
+    pub rank: usize,
+    #[config(default = "Initializer::Zeros")]
+    pub a_initializer: Initializer,
+    #[config(default = "Initializer::KaimingUniform{gain:1.0/3.0f64.sqrt(), fan_out_only:false}")]
+    pub b_initializer: Initializer,
+}
+
+impl LoRAConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> LoRA<B> {
+        LoRA {
+            a: self.a_initializer.init([self.dim, self.rank], device),
+            b: self.b_initializer.init([self.rank, self.dim], device),
+        }
+    }
+}
+
+impl<B: Backend> LoRA<B> {
+    /// x: [batch_size, seq, dim]
+    /// out: [batch_size, seq, dim]
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        // [b, seq, dim] @ [1, dim, r] -> [b, seq, r]
+        // [b, seq, r] @ [1, r, dim] -> [b, seq, dim]
+        x.matmul(self.a.val().unsqueeze())
+            .matmul(self.b.val().unsqueeze())
+    }
+}
+
+#[derive(Module, Debug)]
 pub struct Attention<B: Backend> {
     pub qkv: LinearKMaskedBias<B>,
     pub proj: Linear<B>,
     pub drop_out: Dropout,
+    pub lora: Option<LoRA<B>>,
     pub num_heads: usize,
 }
 
@@ -141,6 +179,7 @@ impl<B: Backend> Attention<B> {
             },
             proj: LinearConfig::new(dim, dim).with_bias(true).init(device),
             drop_out: DropoutConfig::new(0.0).init(), // did not see any config other than 0 in facebook repo
+            lora: None,
             num_heads,
         }
     }
@@ -151,17 +190,29 @@ impl<B: Backend> Attention<B> {
         repo: Option<&(Tensor<B, 2>, Tensor<B, 2>)>,
     ) -> Tensor<B, 3> {
         let [batch_size, seq_len, dim] = x.dims();
-        let qkv = self.qkv.forward(x);
+        // [b, seq, dim] @ [1, dim, dim * 3] -> [b, seq, dim * 3]
+        let qkv = self.qkv.forward(x.clone());
 
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.num_heads, dim / self.num_heads]);
 
-        let [mut q, mut k, v]: [Tensor<B, 4>; 3] = qkv
+        let [mut q, mut k, mut v]: [Tensor<B, 4>; 3] = qkv
             .chunk(3, 2)
             .into_iter()
             .map(|tensor| tensor.squeeze_dim::<4>(2).swap_dims(1, 2))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>() // [b, nh, s, dh]
             .try_into()
             .unwrap();
+
+        if let Some(lora) = self.lora.as_ref() {
+            q = q + lora
+                .forward(x.clone())
+                .reshape([batch_size, seq_len, self.num_heads, dim / self.num_heads])
+                .swap_dims(1, 2);
+            v = v + lora
+                .forward(x)
+                .reshape([batch_size, seq_len, self.num_heads, dim / self.num_heads])
+                .swap_dims(1, 2);
+        }
 
         if let Some((sin, cos)) = repo {
             q = Self::apply_rope(q, sin, cos);
@@ -175,22 +226,19 @@ impl<B: Backend> Attention<B> {
     }
 
     fn apply_rope(x: Tensor<B, 4>, sin: &Tensor<B, 2>, cos: &Tensor<B, 2>) -> Tensor<B, 4> {
-        let [b, nh, seq, head_dim] = x.dims();
+        let [_, _, seq, head_dim] = x.dims();
         let [rope_seq, _h_dim] = sin.dims();
         let num_cls_and_storage_tokens = seq - rope_seq;
-        let prefix = x
-            .clone()
-            .slice([..b, ..nh, ..num_cls_and_storage_tokens, ..head_dim]);
-        let mut rope = x.slice([0..b, 0..nh, num_cls_and_storage_tokens..seq, 0..head_dim]);
 
-        let half_dim = head_dim / 2;
-        let x1 = rope.clone().slice([..b, ..nh, ..seq, ..half_dim]);
-        let x2 = rope
-            .clone()
-            .slice([0..b, 0..nh, 0..seq, half_dim..head_dim]);
+        let [prefix, mut rope] = x
+            .split_with_sizes(vec![num_cls_and_storage_tokens, rope_seq], 2)
+            .try_into()
+            .unwrap();
+
+        let half_head_dim = head_dim / 2;
+        let [x1, x2] = rope.clone().split(half_head_dim, 3).try_into().unwrap();
 
         let x_half = Tensor::cat(vec![x2.mul_scalar(-1.0), x1], 3);
-
         rope = (rope * cos.clone().reshape([1, 1, rope_seq, head_dim]))
             + (x_half * sin.clone().reshape([1, 1, rope_seq, head_dim]));
 
@@ -268,7 +316,7 @@ pub struct DinoVisionTransformer<B: Backend> {
     pub rope_embed: RopePositionEmbedding<B>,
     pub blocks: Vec<Block<B>>,
     pub norm: LayerNorm<B>,
-    pub mask_token: Param<Tensor<B, 2>>,
+    pub mask_token: Option<Param<Tensor<B, 2>>>,
 }
 
 impl<B: Backend> DinoVisionTransformer<B> {
@@ -296,7 +344,7 @@ impl<B: Backend> DinoVisionTransformer<B> {
             rope_embed,
             blocks,
             norm,
-            mask_token,
+            mask_token: Some(mask_token),
         }
     }
 
@@ -304,13 +352,15 @@ impl<B: Backend> DinoVisionTransformer<B> {
         let (mut x, height, width) = self.patch_embed.forward(x);
         let [batch_size, seq, dim] = x.dims();
 
-        if let Some(masks) = masks {
+        if let Some(masks) = masks
+            && let Some(mask_token) = self.mask_token.as_ref()
+        {
             x = x.mask_where(
                 masks
                     .clone()
                     .reshape([1, seq, dim])
                     .repeat_dim(0, batch_size),
-                self.mask_token
+                mask_token
                     .val()
                     .reshape([1, 1, dim])
                     .repeat_dim(1, seq)
