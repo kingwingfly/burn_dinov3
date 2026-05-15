@@ -13,4 +13,5 @@ keywords = ["dinov3", "dino", "burn", "vit"]
 burn = "0.21"
 
 [dev-dependencies]
+burn = { version = "0.21", features = ["cuda"] }
 burn-store = "0.21"
