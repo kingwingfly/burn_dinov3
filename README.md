@@ -53,7 +53,7 @@ Do not forget [image-transforms](https://github.com/facebookresearch/dinov3#imag
 
 # Others
 
-There's no test for `v0.1.0`, only all tensor loaded and just seems working.
+There's no test for now, only all tensor loaded and just seems working.
 
 The API will be changed as I like, no sem ver guarentee (although there is likely no big change).
 

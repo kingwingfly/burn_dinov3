@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["kingwingfly <836250617@qq.com>"]
 license = "MIT"
 repository = "https://github.com/kingwingfly/burn_dinov3"
-documentation = "https://github.com/kingwingfly/burn_dinov3"
+documentation = "https://docs.rs/burn_dinov3"
 description = "DINOv3 with burn & Rust"
 keywords = ["dinov3", "dino", "burn", "vit"]
 
