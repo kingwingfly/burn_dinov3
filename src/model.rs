@@ -49,7 +49,8 @@ impl<B: Backend> RopePositionEmbedding<B> {
         let periods = Param::from_tensor(
             Tensor::from_floats([base], device)
                 .powf(Tensor::arange_step(0..d_head as i64, 4, device).float() / d_head as f32),
-        ); // do not update
+        )
+        .no_grad(); // do not update
 
         Self { periods, d_head }
     }
@@ -139,7 +140,7 @@ impl<B: Backend> Attention<B> {
                 bias_mask: Param::from_tensor(Tensor::zeros([dim * 3], device)),
             },
             proj: LinearConfig::new(dim, dim).with_bias(true).init(device),
-            drop_out: DropoutConfig::new(0.0).init(),
+            drop_out: DropoutConfig::new(0.0).init(), // did not see any config other than 0 in facebook repo
             num_heads,
         }
     }

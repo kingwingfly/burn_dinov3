@@ -2,8 +2,15 @@
 name = "burn_dinov3"
 version = "0.1.0"
 edition = "2024"
+authors = ["kingwingfly <836250617@qq.com>"]
+license = "MIT"
+repository = "https://github.com/kingwingfly/dinov3"
+documentation = "https://github.com/kingwingfly/dinov3"
+description = "DINOv3 with burn"
+keywords = ["dinov3", "dino", "burn", "vit"]
 
 [dependencies]
-anyhow = "1.0.102"
-burn = { version = "0.21.0", features = ["cuda"] }
-burn-store = "0.21.0"
+burn = "0.21"
+
+[dev-dependencies]
+burn-store = "0.21"
