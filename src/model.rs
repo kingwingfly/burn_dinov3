@@ -69,7 +69,7 @@ impl<B: Backend> RopePositionEmbedding<B> {
         coords = coords * 2.0 - 1.0;
 
         // [hw, 2, 1] / [1, 1, d_head/4] -> [hw, 2, d_head/4]
-        let angles = coords.unsqueeze_dim::<3>(2) * std::f64::consts::PI * 2.0
+        let angles = coords.unsqueeze_dim::<3>(2) * std::f32::consts::PI * 2.0
             / self
                 .periods
                 .val()
@@ -124,7 +124,7 @@ pub trait LoRALayer<B: Backend>: Module<B> {
     type Config: LoRALayerConfig<B, LoRA = Self>;
 
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3>;
-    fn alpha_div_dim(&self) -> f64;
+    fn alpha_div_dim(&self) -> f32;
 }
 
 pub trait LoRALayerConfig<B: Backend> {
@@ -136,7 +136,7 @@ pub trait LoRALayerConfig<B: Backend> {
 #[derive(Config, Debug)]
 pub struct LoRAConfig {
     pub rank: usize,
-    pub alpha: f64,
+    pub alpha: f32,
     #[config(default = "Initializer::KaimingUniform{gain:1.0/3.0f64.sqrt(), fan_out_only:false}")]
     pub a_initializer: Initializer,
     #[config(default = "Initializer::Zeros")]
@@ -148,7 +148,7 @@ pub struct LoRA<B: Backend> {
     pub a: Param<Tensor<B, 2>>,
     pub b_q: Param<Tensor<B, 2>>,
     pub b_v: Param<Tensor<B, 2>>,
-    pub alpha_div_dim: f64,
+    pub alpha_div_dim: f32,
 }
 
 impl<B: Backend> LoRALayerConfig<B> for LoRAConfig {
@@ -165,7 +165,7 @@ impl<B: Backend> LoRALayerConfig<B> for LoRAConfig {
             ),
             b_q: self.b_initializer.init([self.rank, dim], device),
             b_v: self.b_initializer.init([self.rank, dim], device),
-            alpha_div_dim: self.alpha / dim as f64,
+            alpha_div_dim: self.alpha / dim as f32,
         }
     }
 }
@@ -189,7 +189,7 @@ impl<B: Backend> LoRALayer<B> for LoRA<B> {
         Tensor::cat(vec![lora_q, lora_k, lora_v], 2) // [b, seq, dim * 3]
     }
 
-    fn alpha_div_dim(&self) -> f64 {
+    fn alpha_div_dim(&self) -> f32 {
         self.alpha_div_dim
     }
 }
@@ -335,7 +335,7 @@ impl BlockConfig {
         lora: Option<L>,
         device: &B::Device,
     ) -> Block<B, L> {
-        let hidden_dim = (self.dim as f64 * self.ffn_ratio) as usize;
+        let hidden_dim = (self.dim as f64 * self.ffn_ratio).round() as usize;
         Block {
             norm1: LayerNormConfig::new(self.dim).with_bias(true).init(device),
             attn: AttentionConfig::new(self.dim, self.num_heads).init(lora, device),
