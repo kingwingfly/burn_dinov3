@@ -125,6 +125,7 @@ pub trait LoRALayer<B: Backend>: Module<B> {
 
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3>;
     fn alpha_div_dim(&self) -> f32;
+    fn set_require_grad(self, grad: bool) -> Self;
 }
 
 pub trait LoRALayerConfig<B: Backend> {
@@ -191,6 +192,13 @@ impl<B: Backend> LoRALayer<B> for LoRA<B> {
 
     fn alpha_div_dim(&self) -> f32 {
         self.alpha_div_dim
+    }
+
+    fn set_require_grad(mut self, grad: bool) -> Self {
+        self.a = self.a.set_require_grad(grad);
+        self.b_q = self.b_q.set_require_grad(grad);
+        self.b_v = self.b_v.set_require_grad(grad);
+        self
     }
 }
 
@@ -409,7 +417,7 @@ impl DinoVisionTransformerConfig {
                 .init(lora.clone(), device)
         })
         .take(self.depth)
-        .collect();
+        .collect::<Vec<_>>();
 
         let norm = LayerNormConfig::new(self.embed_dim).init(device);
 
@@ -458,6 +466,17 @@ impl<B: Backend, L: LoRALayer<B>> DinoVisionTransformer<B, L> {
         }
 
         self.norm.forward(x)
+    }
+
+    pub fn no_grad_expect_lora(self) -> Self
+    where
+        Self: Module<B>,
+    {
+        let mut this = self.no_grad();
+        this.blocks.iter_mut().for_each(|blk| {
+            blk.attn.lora = blk.attn.lora.take().map(|l| l.set_require_grad(true));
+        });
+        this
     }
 }
 

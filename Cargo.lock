@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "burn_dinov3"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "burn",
  "burn-store",
