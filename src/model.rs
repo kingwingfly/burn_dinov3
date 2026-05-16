@@ -12,8 +12,6 @@ use burn::{
 #[derive(Module, Debug)]
 pub struct PatchEmbed<B: Backend> {
     pub proj: Conv2d<B>,
-    pub patch_size: usize,
-    pub embed_dim: usize,
 }
 
 impl<B: Backend> PatchEmbed<B> {
@@ -21,11 +19,7 @@ impl<B: Backend> PatchEmbed<B> {
         let proj = Conv2dConfig::new([in_chans, embed_dim], [patch_size, patch_size])
             .with_stride([patch_size, patch_size])
             .init(device);
-        Self {
-            proj,
-            patch_size,
-            embed_dim,
-        }
+        Self { proj }
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> (Tensor<B, 3>, usize, usize) {
@@ -40,7 +34,6 @@ impl<B: Backend> PatchEmbed<B> {
 pub struct RopePositionEmbedding<B: Backend> {
     // Facebook engineers save periods in its pth model.
     pub periods: Param<Tensor<B, 1>>,
-    pub d_head: usize,
 }
 
 impl<B: Backend> RopePositionEmbedding<B> {
@@ -53,7 +46,7 @@ impl<B: Backend> RopePositionEmbedding<B> {
         )
         .no_grad(); // do not update
 
-        Self { periods, d_head }
+        Self { periods }
     }
 
     pub fn forward(&self, height: usize, width: usize) -> (Tensor<B, 2>, Tensor<B, 2>) {
@@ -144,7 +137,12 @@ pub struct LoRAConfig {
 impl LoRAConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> LoRA<B> {
         LoRA {
-            a: self.a_initializer.init([self.dim, self.rank], device),
+            a: self.a_initializer.init_with(
+                [self.dim, self.rank],
+                Some(self.dim),
+                Some(self.rank),
+                device,
+            ),
             b: self.b_initializer.init([self.rank, self.dim], device),
         }
     }
@@ -161,6 +159,14 @@ impl<B: Backend> LoRA<B> {
     }
 }
 
+#[derive(Config, Debug)]
+pub struct AttentionConfig {
+    pub dim: usize,
+    pub num_heads: usize,
+    #[config(default = "None")]
+    pub lora: Option<LoRAConfig>,
+}
+
 #[derive(Module, Debug)]
 pub struct Attention<B: Backend> {
     pub qkv: LinearKMaskedBias<B>,
@@ -170,20 +176,26 @@ pub struct Attention<B: Backend> {
     pub num_heads: usize,
 }
 
-impl<B: Backend> Attention<B> {
-    pub fn new(dim: usize, num_heads: usize, device: &B::Device) -> Self {
-        Self {
+impl AttentionConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Attention<B> {
+        Attention {
             qkv: LinearKMaskedBias {
-                linear: LinearConfig::new(dim, dim * 3).with_bias(true).init(device),
-                bias_mask: Param::from_tensor(Tensor::zeros([dim * 3], device)),
+                linear: LinearConfig::new(self.dim, self.dim * 3)
+                    .with_bias(true)
+                    .init(device),
+                bias_mask: Param::from_tensor(Tensor::zeros([self.dim * 3], device)).no_grad(),
             },
-            proj: LinearConfig::new(dim, dim).with_bias(true).init(device),
+            proj: LinearConfig::new(self.dim, self.dim)
+                .with_bias(true)
+                .init(device),
             drop_out: DropoutConfig::new(0.0).init(), // did not see any config other than 0 in facebook repo
-            lora: None,
-            num_heads,
+            lora: self.lora.as_ref().map(|config| config.init(device)),
+            num_heads: self.num_heads,
         }
     }
+}
 
+impl<B: Backend> Attention<B> {
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
@@ -269,6 +281,14 @@ impl<B: Backend> Mlp<B> {
     }
 }
 
+#[derive(Config, Debug)]
+pub struct BlockConfig {
+    pub dim: usize,
+    pub num_heads: usize,
+    pub ffn_ratio: f64,
+    pub lora: Option<LoRAConfig>,
+}
+
 #[derive(Module, Debug)]
 pub struct Block<B: Backend> {
     pub norm1: LayerNorm<B>,
@@ -279,19 +299,23 @@ pub struct Block<B: Backend> {
     pub ls2: LayerScale<B>,
 }
 
-impl<B: Backend> Block<B> {
-    pub fn new(dim: usize, num_heads: usize, ffn_ratio: f64, device: &B::Device) -> Self {
-        let hidden_dim = (dim as f64 * ffn_ratio) as usize;
-        Self {
-            norm1: LayerNormConfig::new(dim).with_bias(true).init(device),
-            attn: Attention::new(dim, num_heads, device),
-            ls1: LayerScale::new(dim, 1e-5, device),
-            norm2: LayerNormConfig::new(dim).with_bias(true).init(device),
-            mlp: Mlp::new(dim, hidden_dim, device),
-            ls2: LayerScale::new(dim, 1e-5, device),
+impl BlockConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Block<B> {
+        let hidden_dim = (self.dim as f64 * self.ffn_ratio) as usize;
+        Block {
+            norm1: LayerNormConfig::new(self.dim).with_bias(true).init(device),
+            attn: AttentionConfig::new(self.dim, self.num_heads)
+                .with_lora(self.lora.clone())
+                .init(device),
+            ls1: LayerScale::new(self.dim, 1e-5, device),
+            norm2: LayerNormConfig::new(self.dim).with_bias(true).init(device),
+            mlp: Mlp::new(self.dim, hidden_dim, device),
+            ls2: LayerScale::new(self.dim, 1e-5, device),
         }
     }
+}
 
+impl<B: Backend> Block<B> {
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
@@ -308,6 +332,19 @@ impl<B: Backend> Block<B> {
     }
 }
 
+#[derive(Config, Debug)]
+pub struct DinoVisionTransformerConfig {
+    pub patch_size: usize,
+    pub embed_dim: usize,
+    pub num_storage_tokens: usize,
+    pub depth: usize,
+    pub num_heads: usize,
+    pub ffn_ratio: f64,
+    pub lora: Option<LoRAConfig>,
+    #[config(default = "Initializer::Normal { mean: 0.0, std: 0.02 }")]
+    pub initializer: Initializer,
+}
+
 #[derive(Module, Debug)]
 pub struct DinoVisionTransformer<B: Backend> {
     pub patch_embed: PatchEmbed<B>,
@@ -319,25 +356,30 @@ pub struct DinoVisionTransformer<B: Backend> {
     pub mask_token: Option<Param<Tensor<B, 2>>>,
 }
 
-impl<B: Backend> DinoVisionTransformer<B> {
-    pub fn new(
-        patch_size: usize,
-        embed_dim: usize,
-        num_storage_tokens: usize,
-        depth: usize,
-        num_heads: usize,
-        ffn_ratio: f64,
-        device: &B::Device,
-    ) -> Self {
-        let patch_embed = PatchEmbed::new(3, embed_dim, patch_size, device);
-        let cls_token = Param::from_tensor(Tensor::zeros([1, 1, embed_dim], device));
-        let storage_tokens =
-            Param::from_tensor(Tensor::zeros([1, num_storage_tokens, embed_dim], device));
-        let rope_embed = RopePositionEmbedding::new(embed_dim, num_heads, 100.0, device).no_grad();
-        let blocks = vec![Block::new(embed_dim, num_heads, ffn_ratio, device); depth];
-        let norm = LayerNormConfig::new(embed_dim).init(device);
-        let mask_token = Param::from_tensor(Tensor::zeros([1, embed_dim], device));
-        Self {
+impl DinoVisionTransformerConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> DinoVisionTransformer<B> {
+        let patch_embed = PatchEmbed::new(3, self.embed_dim, self.patch_size, device);
+
+        let cls_token = self.initializer.init([1, 1, self.embed_dim], device);
+        let storage_tokens = self
+            .initializer
+            .init([1, self.num_storage_tokens, self.embed_dim], device);
+
+        let rope_embed =
+            RopePositionEmbedding::new(self.embed_dim, self.num_heads, 100.0, device).no_grad();
+
+        let blocks = vec![
+            BlockConfig::new(self.embed_dim, self.num_heads, self.ffn_ratio)
+                .with_lora(self.lora.clone())
+                .init(device);
+            self.depth
+        ];
+
+        let norm = LayerNormConfig::new(self.embed_dim).init(device);
+
+        let mask_token = Param::from_tensor(Tensor::zeros([1, self.embed_dim], device)).no_grad();
+
+        DinoVisionTransformer {
             patch_embed,
             cls_token,
             storage_tokens,
@@ -347,7 +389,9 @@ impl<B: Backend> DinoVisionTransformer<B> {
             mask_token: Some(mask_token),
         }
     }
+}
 
+impl<B: Backend> DinoVisionTransformer<B> {
     pub fn forward(&self, x: Tensor<B, 4>, masks: Option<&Tensor<B, 2, Bool>>) -> Tensor<B, 3> {
         let (mut x, height, width) = self.patch_embed.forward(x);
         let [batch_size, seq, dim] = x.dims();
@@ -383,30 +427,72 @@ impl<B: Backend> DinoVisionTransformer<B> {
     }
 }
 
-pub fn vit_small<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 384, 4, 12, 6, 4.0, device)
+pub fn vit_small<B: Backend>(
+    patch_size: usize,
+    lora_rank: Option<usize>,
+    device: &B::Device,
+) -> DinoVisionTransformer<B> {
+    DinoVisionTransformerConfig::new(patch_size, 384, 4, 12, 6, 4.0)
+        .with_lora(lora_rank.map(|rank| LoRAConfig::new(384, rank)))
+        .init(device)
 }
 
-pub fn vit_base<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 768, 4, 12, 12, 4.0, device)
+pub fn vit_base<B: Backend>(
+    patch_size: usize,
+    lora_rank: Option<usize>,
+    device: &B::Device,
+) -> DinoVisionTransformer<B> {
+    DinoVisionTransformerConfig::new(patch_size, 768, 4, 12, 12, 4.0)
+        .with_lora(lora_rank.map(|rank| LoRAConfig::new(768, rank)))
+        .init(device)
 }
 
-pub fn vit_large<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 1024, 4, 24, 16, 4.0, device)
+pub fn vit_large<B: Backend>(
+    patch_size: usize,
+    lora_rank: Option<usize>,
+    device: &B::Device,
+) -> DinoVisionTransformer<B> {
+    DinoVisionTransformerConfig::new(patch_size, 1024, 4, 24, 16, 4.0)
+        .with_lora(lora_rank.map(|rank| LoRAConfig::new(1024, rank)))
+        .init(device)
 }
 
-pub fn vit_so400m<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 1152, 4, 27, 18, 3.777777778, device)
+pub fn vit_so400m<B: Backend>(
+    patch_size: usize,
+    lora_rank: Option<usize>,
+    device: &B::Device,
+) -> DinoVisionTransformer<B> {
+    DinoVisionTransformerConfig::new(patch_size, 1152, 4, 27, 18, 3.777777778)
+        .with_lora(lora_rank.map(|rank| LoRAConfig::new(1152, rank)))
+        .init(device)
 }
 
-pub fn vit_huge2<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 1280, 4, 32, 20, 4.0, device)
+pub fn vit_huge2<B: Backend>(
+    patch_size: usize,
+    lora_rank: Option<usize>,
+    device: &B::Device,
+) -> DinoVisionTransformer<B> {
+    DinoVisionTransformerConfig::new(patch_size, 1280, 4, 32, 20, 4.0)
+        .with_lora(lora_rank.map(|rank| LoRAConfig::new(1280, rank)))
+        .init(device)
 }
 
-pub fn vit_giant2<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 1536, 4, 40, 24, 4.0, device)
+pub fn vit_giant2<B: Backend>(
+    patch_size: usize,
+    lora_rank: Option<usize>,
+    device: &B::Device,
+) -> DinoVisionTransformer<B> {
+    DinoVisionTransformerConfig::new(patch_size, 1536, 4, 40, 24, 4.0)
+        .with_lora(lora_rank.map(|rank| LoRAConfig::new(1536, rank)))
+        .init(device)
 }
 
-pub fn vit_7b<B: Backend>(patch_size: usize, device: &B::Device) -> DinoVisionTransformer<B> {
-    DinoVisionTransformer::new(patch_size, 4096, 4, 40, 32, 3.0, device)
+pub fn vit_7b<B: Backend>(
+    patch_size: usize,
+    lora_rank: Option<usize>,
+    device: &B::Device,
+) -> DinoVisionTransformer<B> {
+    DinoVisionTransformerConfig::new(patch_size, 4096, 4, 40, 32, 3.0)
+        .with_lora(lora_rank.map(|rank| LoRAConfig::new(4096, rank)))
+        .init(device)
 }

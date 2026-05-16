@@ -1,18 +1,25 @@
 With [burn](https://github.com/tracel-ai/burn), This DINOv3 crate is a RIIR of [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3)'s python project.
 
+**LoRA is supported**
+
 # Usage
 
 Download pretrained model from [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3).
 
-Loaded pretrained model:
+Loaded pretrained model with LoRA enabled with rank `8`:
 ```rust no_run
-use burn::{Tensor, backend::Cuda};
+use burn::{Tensor, backend};
 use burn_dinov3::{DinoVisionTransformer, vit_small};
 use burn_store::{ModuleSnapshot, PytorchStore};
 
+#[cfg(target_os = "macos")]
+type Backend = backend::Metal;
+#[cfg(not(target_os = "macos"))]
+type Backend = backend::Cuda;
+
 fn main() {
     let device = Default::default();
-    let mut dino: DinoVisionTransformer<Cuda> = vit_small(16, &device);
+    let mut dino: DinoVisionTransformer<Backend> = vit_small(16, Some(8), &device); // LoRA rank 8
 
     let res = dino
         .load_from(
@@ -20,7 +27,8 @@ fn main() {
                 .with_key_remapping(r"norm(\d*)\.weight$", r"norm$1.gamma")
                 .with_key_remapping(r"norm(\d*)\.bias$", "norm$1.beta")
                 .with_key_remapping(r"attn.qkv.weight$", "attn.qkv.linear.weight")
-                .with_key_remapping(r"attn.qkv.bias$", "attn.qkv.linear.bias"),
+                .with_key_remapping(r"attn.qkv.bias$", "attn.qkv.linear.bias")
+                .allow_partial(true), // pretrained model has no LoRA
         )
         .inspect_err(|e| println!("{e}"))
         .unwrap();
@@ -37,24 +45,47 @@ And got:
 │
 │ ✓ Successfully applied: 188 tensors
 │ ⊘ Skipped (filtered):  0 tensors
-│ ✗ Missing in source:    0 tensors
+│ ✗ Missing in source:    24 tensors
 │ ? Unused in target:     0 tensors
 │ ! Errors:               0 errors
 │
+├─ Missing Tensors (requested by model but not found in source)
+│
+│  First 10 missing tensors:
+│    • blocks.0.attn.lora.a
+│    • blocks.0.attn.lora.b
+│    • blocks.1.attn.lora.a
+│    • blocks.1.attn.lora.b
+│    • blocks.10.attn.lora.a
+│    • blocks.10.attn.lora.b
+│    • blocks.11.attn.lora.a
+│    • blocks.11.attn.lora.b
+│    • blocks.2.attn.lora.a
+│    • blocks.2.attn.lora.b
+│    ... and 14 more
+│
 └───────────────────────────────────────────────────
-[src/main.rs:24:5] dino.forward(Tensor::zeros([1, 3, 256, 256], &device), None) = Tensor {
+[examples/load.rs:28:5] dino.forward(Tensor::zeros([1, 3, 256, 256], &device), None) = Tensor {
     primitive: Float(
-        { id: TensorId { value: 1289 }, shape: Shape { dims: [1, 261, 384] }, device: Cuda(0) },
+        { id: TensorId { value: 1479 }, shape: Shape { dims: [1, 261, 384] }, device: DefaultDevice },
     ),
 }
 ```
+
+Only LoRA weights are missed.
 
 Do not forget [image-transforms](https://github.com/facebookresearch/dinov3#image-transforms) in practice.
 
 # Others
 
-There's no test for now, only all tensor loaded and just seems working.
+There's no test for `v0.1`, only all tensor loaded and just seems working.
 
-The API will be changed as I like, no sem ver guarentee (although there is likely no big change).
+The API will be changed as I like, no sem ver guarentee (although there is likely no big change) in `v0.1`.
 
 If I found any version is not correct, I'll simply yank it.
+
+After my finishing fine tuning with this crate, and ensuring the implementation is correct, I'll bump the version up to `v0.2`.
+
+# Contribution
+
+Let me know if you want to add some functions by giving an issue, so that we'll not confict with each other.

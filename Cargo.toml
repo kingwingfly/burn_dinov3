@@ -12,6 +12,11 @@ keywords = ["dinov3", "dino", "burn", "vit"]
 [dependencies]
 burn = "0.21"
 
-[dev-dependencies]
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+burn = { version = "0.21", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
 burn = { version = "0.21", features = ["cuda"] }
+
+[dev-dependencies]
 burn-store = "0.21"
