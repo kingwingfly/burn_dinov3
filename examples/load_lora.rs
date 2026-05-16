@@ -10,7 +10,7 @@ type Backend = backend::Cuda;
 fn main() {
     let device = Default::default();
     let mut dino: DinoVisionTransformer<Backend, LoRA<Backend>> =
-        vit_small(16, Some(LoRAConfig::new(8)), &device);
+        vit_small(16, Some(LoRAConfig::new(8, 16.0)), &device);
 
     let res = dino
         .load_from(
