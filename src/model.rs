@@ -144,18 +144,24 @@ pub struct LoRAConfig {
 #[derive(Module, Debug)]
 pub struct LoRA<B: Backend> {
     pub a: Param<Tensor<B, 2>>,
-    pub b: Param<Tensor<B, 2>>,
+    pub b_q: Param<Tensor<B, 2>>,
+    pub b_v: Param<Tensor<B, 2>>,
 }
 
 impl<B: Backend> LoRALayerConfig<B> for LoRAConfig {
     type LoRA = LoRA<B>;
 
+    /// dim: one of q/k/v's dim
     fn init(&self, dim: usize, device: &B::Device) -> Self::LoRA {
         LoRA {
-            a: self
-                .a_initializer
-                .init_with([dim, self.rank], Some(dim), Some(self.rank), device),
-            b: self.b_initializer.init([self.rank, dim], device),
+            a: self.a_initializer.init_with(
+                [dim, self.rank],
+                Some(dim * 3),
+                Some(self.rank),
+                device,
+            ),
+            b_q: self.b_initializer.init([self.rank, dim], device),
+            b_v: self.b_initializer.init([self.rank, dim], device),
         }
     }
 }
@@ -164,12 +170,19 @@ impl<B: Backend> LoRALayer<B> for LoRA<B> {
     type Config = LoRAConfig;
 
     /// x: [batch_size, seq, dim]
-    /// out: [batch_size, seq, dim]
+    /// out: [batch_size, seq, dim * 3]
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         // [b, seq, dim] @ [1, dim, r] -> [b, seq, r]
+        let hidden = x.matmul(self.a.val().unsqueeze());
+
         // [b, seq, r] @ [1, r, dim] -> [b, seq, dim]
-        x.matmul(self.a.val().unsqueeze())
-            .matmul(self.b.val().unsqueeze())
+        let lora_q = hidden.clone().matmul(self.b_q.val().unsqueeze());
+        // [b, seq, r] @ [1, r, dim] -> [b, seq, dim]
+        let lora_v = hidden.matmul(self.b_v.val().unsqueeze());
+
+        let lora_k = lora_q.zeros_like();
+
+        Tensor::cat(vec![lora_q, lora_k, lora_v], 2) // [b, seq, dim * 3]
     }
 }
 
@@ -219,28 +232,21 @@ impl<B: Backend, L: LoRALayer<B>> Attention<B, L> {
     ) -> Tensor<B, 3> {
         let [batch_size, seq_len, dim] = x.dims();
         // [b, seq, dim] @ [1, dim, dim * 3] -> [b, seq, dim * 3]
-        let qkv = self.qkv.forward(x.clone());
+        let mut qkv = self.qkv.forward(x.clone());
+
+        if let Some(lora) = self.lora.as_ref() {
+            qkv = qkv + lora.forward(x);
+        }
 
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.num_heads, dim / self.num_heads]);
 
-        let [mut q, mut k, mut v]: [Tensor<B, 4>; 3] = qkv
+        let [mut q, mut k, v]: [Tensor<B, 4>; 3] = qkv
             .chunk(3, 2)
             .into_iter()
             .map(|tensor| tensor.squeeze_dim::<4>(2).swap_dims(1, 2))
             .collect::<Vec<_>>() // [b, nh, s, dh]
             .try_into()
             .unwrap();
-
-        if let Some(lora) = self.lora.as_ref() {
-            q = q + lora
-                .forward(x.clone())
-                .reshape([batch_size, seq_len, self.num_heads, dim / self.num_heads])
-                .swap_dims(1, 2);
-            v = v + lora
-                .forward(x)
-                .reshape([batch_size, seq_len, self.num_heads, dim / self.num_heads])
-                .swap_dims(1, 2);
-        }
 
         if let Some((sin, cos)) = repo {
             q = Self::apply_rope(q, sin, cos);
@@ -371,7 +377,7 @@ pub struct DinoVisionTransformer<B: Backend, L: Module<B> = LoRA<B>> {
     pub rope_embed: RopePositionEmbedding<B>,
     pub blocks: Vec<Block<B, L>>,
     pub norm: LayerNorm<B>,
-    pub mask_token: Option<Param<Tensor<B, 2>>>,
+    pub mask_token: Param<Tensor<B, 2>>,
 }
 
 impl DinoVisionTransformerConfig {
@@ -408,7 +414,7 @@ impl DinoVisionTransformerConfig {
             rope_embed,
             blocks,
             norm,
-            mask_token: Some(mask_token),
+            mask_token,
         }
     }
 }
@@ -418,15 +424,13 @@ impl<B: Backend, L: LoRALayer<B>> DinoVisionTransformer<B, L> {
         let (mut x, height, width) = self.patch_embed.forward(x);
         let [batch_size, seq, dim] = x.dims();
 
-        if let Some(masks) = masks
-            && let Some(mask_token) = self.mask_token.as_ref()
-        {
+        if let Some(masks) = masks {
             x = x.mask_where(
                 masks
                     .clone()
                     .reshape([1, seq, dim])
                     .repeat_dim(0, batch_size),
-                mask_token
+                self.mask_token
                     .val()
                     .reshape([1, 1, dim])
                     .repeat_dim(1, seq)
