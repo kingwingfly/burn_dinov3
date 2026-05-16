@@ -1,6 +1,9 @@
 With [burn](https://github.com/tracel-ai/burn), This DINOv3 crate is a RIIR of [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3)'s python project.
 
-**LoRA is supported**
+# Features
+
+- Base on burn, so that you can got a cool TUI when training
+- **LoRA is supported**: you can define `LoRA` module youself and inject it into ViT
 
 # Usage
 
@@ -9,7 +12,7 @@ Download pretrained model from [facebookresearch/dinov3](https://github.com/face
 Loaded pretrained model with LoRA enabled with rank `8`:
 ```rust no_run
 use burn::{Tensor, backend};
-use burn_dinov3::{DinoVisionTransformer, vit_small};
+use burn_dinov3::{DinoVisionTransformer, LoRA, LoRAConfig, vit_small};
 use burn_store::{ModuleSnapshot, PytorchStore};
 
 #[cfg(target_os = "macos")]
@@ -19,7 +22,8 @@ type Backend = backend::Cuda;
 
 fn main() {
     let device = Default::default();
-    let mut dino: DinoVisionTransformer<Backend> = vit_small(16, Some(8), &device); // LoRA rank 8
+    let mut dino: DinoVisionTransformer<Backend, LoRA<Backend>> =
+        vit_small(16, Some(LoRAConfig::new(8)), &device); // modify to `None` to cancel LoRA
 
     let res = dino
         .load_from(
@@ -28,7 +32,7 @@ fn main() {
                 .with_key_remapping(r"norm(\d*)\.bias$", "norm$1.beta")
                 .with_key_remapping(r"attn.qkv.weight$", "attn.qkv.linear.weight")
                 .with_key_remapping(r"attn.qkv.bias$", "attn.qkv.linear.bias")
-                .allow_partial(true), // pretrained model has no LoRA
+                .allow_partial(true),
         )
         .inspect_err(|e| println!("{e}"))
         .unwrap();

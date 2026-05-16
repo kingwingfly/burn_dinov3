@@ -1,5 +1,5 @@
 use burn::{Tensor, backend};
-use burn_dinov3::{DinoVisionTransformer, vit_small};
+use burn_dinov3::{DinoVisionTransformer, LoRA, LoRAConfig, vit_small};
 use burn_store::{ModuleSnapshot, PytorchStore};
 
 #[cfg(target_os = "macos")]
@@ -9,7 +9,8 @@ type Backend = backend::Cuda;
 
 fn main() {
     let device = Default::default();
-    let mut dino: DinoVisionTransformer<Backend> = vit_small(16, None, &device);
+    let mut dino: DinoVisionTransformer<Backend, LoRA<Backend>> =
+        vit_small(16, Some(LoRAConfig::new(8)), &device);
 
     let res = dino
         .load_from(
@@ -17,7 +18,8 @@ fn main() {
                 .with_key_remapping(r"norm(\d*)\.weight$", r"norm$1.gamma")
                 .with_key_remapping(r"norm(\d*)\.bias$", "norm$1.beta")
                 .with_key_remapping(r"attn.qkv.weight$", "attn.qkv.linear.weight")
-                .with_key_remapping(r"attn.qkv.bias$", "attn.qkv.linear.bias"),
+                .with_key_remapping(r"attn.qkv.bias$", "attn.qkv.linear.bias")
+                .allow_partial(true),
         )
         .inspect_err(|e| println!("{e}"))
         .unwrap();
