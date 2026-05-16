@@ -468,7 +468,7 @@ impl<B: Backend, L: LoRALayer<B>> DinoVisionTransformer<B, L> {
         self.norm.forward(x)
     }
 
-    pub fn no_grad_expect_lora(self) -> Self
+    pub fn no_grad_except_lora(self) -> Self
     where
         Self: Module<B>,
     {

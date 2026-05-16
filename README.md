@@ -39,6 +39,8 @@ fn main() {
 
     println!("{}", res);
 
+    dino = dino.no_grad_except_lora();
+
     dbg!(dino.forward(Tensor::zeros([1, 3, 256, 256], &device), None));
 }
 ```
