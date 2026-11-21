@@ -10,13 +10,14 @@ description = "DINOv3 with burn & Rust"
 keywords = ["dinov3", "dino", "burn", "vit"]
 
 [dependencies]
-burn = "0.21"
+burn = "0.22.1"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-burn = { version = "0.21", features = ["metal"] }
+burn = { version = "0.22.1", features = ["metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dev-dependencies]
-burn = { version = "0.21", features = ["cuda"] }
+burn = { version = "0.22.1", features = ["cuda"] }
 
 [dev-dependencies]
-burn-store = "0.21"
+burn = { version = "0.22.1", features = ["flex"] }
+burn-store = { version = "0.22.1", features = ["pytorch"] }

@@ -1,0 +1,252 @@
+use burn::{
+    module::{Module, Param},
+    nn::Initializer,
+    tensor::{Bool, Device, Tensor},
+};
+use burn_dinov3::{
+    DinoVisionTransformer, DinoVisionTransformerConfig, LoRA, LoRAConfig, LoRALayer,
+    LoRALayerConfig,
+    model::{AttentionConfig, FeedForward},
+    vit_7b, vit_huge_plus, vit_large_plus, vit_small_plus,
+};
+
+#[test]
+fn masks_replace_only_the_selected_patches_in_each_image() {
+    let device = Device::flex().autodiff();
+    let mut model: DinoVisionTransformer =
+        DinoVisionTransformerConfig::new(2, 8, 0, 0, 2, 2.0).init(None, &device);
+    model.mask_token = Param::from_tensor(Tensor::arange(0..8, &device).float().reshape([1, 8]));
+    let images = Tensor::arange(0..96, &device).float().reshape([2, 3, 4, 4]);
+    let mask = [[false, true, true, false], [true, false, false, true]];
+    let shared = Tensor::<2, Bool>::from_data([mask[0]], &device);
+    let repeated = Tensor::<2, Bool>::from_data([mask[0], mask[0]], &device);
+    assert_eq!(
+        model.forward(images.clone(), Some(&shared)).into_data(),
+        model.forward(images.clone(), Some(&repeated)).into_data(),
+    );
+    let plain = model.forward(images.clone(), None);
+    let masked = model.forward(images, Some(&Tensor::<2, Bool>::from_data(mask, &device)));
+    assert_eq!(masked.dims(), [2, 5, 8]);
+    let expected_mask = model
+        .norm
+        .forward(model.mask_token.val())
+        .into_data()
+        .try_into_vec::<f32>()
+        .unwrap();
+    let plain = plain.into_data().try_into_vec::<f32>().unwrap();
+    let data = masked.to_data().try_into_vec::<f32>().unwrap();
+    for (b, row) in mask.iter().enumerate() {
+        for token in 0..5 {
+            let offset = (b * 5 + token) * 8;
+            let expected = if token > 0 && row[token - 1] {
+                &expected_mask[..]
+            } else {
+                &plain[offset..offset + 8]
+            };
+            assert_eq!(&data[offset..offset + 8], expected);
+        }
+    }
+    let grads = masked.select_dim::<2>(2, 0).sum().backward();
+    let grad = model
+        .mask_token
+        .grad(&grads)
+        .unwrap()
+        .into_data()
+        .try_into_vec::<f32>()
+        .unwrap();
+    assert!(grad.iter().any(|g| g.abs() > 0.01));
+}
+
+#[test]
+fn qkv_masks_only_the_key_bias() {
+    let device = Device::flex().autodiff();
+    let mut attn = AttentionConfig::new(4, 1).init::<LoRA>(None, &device);
+    attn.qkv.linear.bias = Some(Initializer::Ones.init([12], &device));
+    let qkv = attn.qkv.forward(Tensor::zeros([1, 1, 4], &device));
+    assert_eq!(
+        qkv.to_data().try_into_vec::<f32>().unwrap(),
+        [1., 1., 1., 1., 0., 0., 0., 0., 1., 1., 1., 1.]
+    );
+    let grads = qkv.sum().backward();
+    assert!(attn.qkv.bias_mask.as_ref().unwrap().grad(&grads).is_none());
+}
+
+#[test]
+fn lora_scales_by_rank_and_trains_independent_adapters() {
+    let device = Device::flex().autodiff();
+    let config = LoRAConfig::new(2, 4.0).with_a_initializer(Initializer::Ones);
+    let adapter = config
+        .clone()
+        .with_b_initializer(Initializer::Ones)
+        .init(4, &device);
+    let update = adapter.forward(Tensor::ones([1, 1, 4], &device)) * adapter.alpha_div_dim();
+    assert_eq!(
+        update.into_data().try_into_vec::<f32>().unwrap(),
+        [16., 16., 16., 16., 0., 0., 0., 0., 16., 16., 16., 16.]
+    );
+    let model: DinoVisionTransformer =
+        DinoVisionTransformerConfig::new(2, 8, 1, 2, 2, 2.0).init(Some(config), &device);
+    let model = model.no_grad_except_lora();
+    let first = model.blocks[0].attn.lora.as_ref().unwrap();
+    let second = model.blocks[1].attn.lora.as_ref().unwrap();
+    assert_ne!(first.a.id, second.a.id);
+    assert_ne!(first.b_q.id, second.b_q.id);
+    assert_ne!(first.b_v.id, second.b_v.id);
+    assert!(!model.mask_token.is_require_grad());
+    let x = Tensor::arange(0..72, &device).float().reshape([1, 3, 4, 6]);
+    let grads = model
+        .forward_cls(x, None)
+        .select_dim::<1>(1, 0)
+        .sum()
+        .backward();
+    for block in &model.blocks {
+        assert!(block.attn.proj.weight.grad(&grads).is_none());
+        let lora = block.attn.lora.as_ref().unwrap();
+        assert!(lora.a.grad(&grads).is_some());
+        assert!(lora.b_q.grad(&grads).is_some());
+        assert!(lora.b_v.grad(&grads).is_some());
+    }
+}
+
+#[test]
+fn swiglu_checkpoint_presets_have_the_released_shapes() {
+    let device = Device::flex();
+    for (builder, dim, depth, width, qkv_bias) in [
+        (
+            vit_small_plus::<LoRA> as fn(_, _, _) -> _,
+            384,
+            12,
+            1536,
+            true,
+        ),
+        (vit_large_plus::<LoRA>, 1024, 24, 4096, true),
+        (vit_huge_plus::<LoRA>, 1280, 32, 5120, true),
+        (vit_7b::<LoRA>, 4096, 40, 8192, false),
+    ] {
+        let model: DinoVisionTransformer = builder(16, None, &device);
+        assert_eq!(model.blocks.len(), depth);
+        let block = &model.blocks[depth - 1];
+        assert_eq!(block.attn.qkv.linear.bias.is_some(), qkv_bias);
+        assert_eq!(block.attn.qkv.bias_mask.is_some(), qkv_bias);
+        assert_eq!(model.local_cls_norm.is_some(), dim == 4096);
+        let FeedForward::SwiGlu(mlp) = &block.mlp else {
+            panic!("expected SwiGLU")
+        };
+        assert_eq!(mlp.w1.weight.lazy_shape().as_slice(), &[dim, width]);
+        assert_eq!(mlp.w2.weight.lazy_shape().as_slice(), &[dim, width]);
+        assert_eq!(mlp.w3.weight.lazy_shape().as_slice(), &[width, dim]);
+    }
+}
+
+#[test]
+fn local_norm_only_applies_to_prefix_tokens_during_training() {
+    let device = Device::flex().autodiff();
+    let mut model: DinoVisionTransformer = DinoVisionTransformerConfig::new(2, 8, 2, 0, 1, 2.0)
+        .with_untie_global_and_local_cls_norm(Some(true))
+        .init(None, &device);
+    let local = model.local_cls_norm.as_mut().unwrap();
+    local.gamma = Initializer::Zeros.init([8], &device);
+    local.beta = Some(Initializer::Ones.init([8], &device));
+    let image = Tensor::arange(0..48, &device).float().reshape([1, 3, 4, 4]);
+    let global = model.forward(image.clone(), None);
+    let local = model.forward_local(image.clone(), None);
+    assert_eq!(
+        local
+            .clone()
+            .narrow(1, 0, 3)
+            .into_data()
+            .try_into_vec::<f32>()
+            .unwrap(),
+        [1.; 24]
+    );
+    assert_eq!(
+        global.clone().narrow(1, 3, 4).into_data(),
+        local.narrow(1, 3, 4).into_data()
+    );
+    let eval = model.valid();
+    let image = image.without_autodiff();
+    assert_eq!(
+        eval.forward_local(image.clone(), None).into_data(),
+        eval.forward(image, None).into_data()
+    );
+}
+
+#[test]
+fn rotary_grid_rescales_during_training_and_rotates_a_prefix_free_sequence() {
+    let device = Device::flex().autodiff();
+    let model: DinoVisionTransformer =
+        DinoVisionTransformerConfig::new(2, 8, 0, 1, 1, 2.0).init(None, &device);
+    let (sin1, _) = model.rope_embed.forward(2, 3);
+    let (sin2, _) = model.rope_embed.forward(2, 3);
+    assert_ne!(sin1.into_data(), sin2.into_data());
+    let eval = model.valid();
+    let (sin, cos) = eval.rope_embed.forward(2, 3);
+    let (sin2, _) = eval.rope_embed.forward(2, 3);
+    assert_eq!(sin.to_data(), sin2.into_data());
+    // First patch center (-1/2, -2/3), with periods 1 and 10 in each axis.
+    let expected = [-0.5_f32, -0.05, -2.0 / 3.0, -2.0 / 30.0];
+    let row = sin
+        .clone()
+        .select_dim::<1>(0, 0)
+        .into_data()
+        .try_into_vec::<f32>()
+        .unwrap();
+    for (i, actual) in row.iter().enumerate() {
+        assert!((actual - (expected[i % 4] * std::f32::consts::TAU).sin()).abs() < 1e-6);
+    }
+    let tokens = Tensor::ones([1, 6, 8], &Device::flex());
+    let output = eval.blocks[0].attn.forward(tokens, Some(&(sin, cos)));
+    assert_eq!(output.dims(), [1, 6, 8]);
+}
+
+#[test]
+fn legacy_config_loads_the_original_mlp_architecture() {
+    use burn::config::Config;
+
+    let config = DinoVisionTransformerConfig::load_binary(
+        br#"{
+        "patch_size": 2, "embed_dim": 8, "num_storage_tokens": 0, "depth": 1,
+        "num_heads": 2, "ffn_ratio": 2.1, "lora": null,
+        "initializer": {"Normal": {"mean": 0.0, "std": 0.02}}
+    }"#,
+    )
+    .unwrap();
+    let model = config.init::<LoRA>(None, &Device::flex());
+    let block = &model.blocks[0];
+    let FeedForward::Mlp(mlp) = &block.mlp else {
+        panic!("expected GELU MLP")
+    };
+    assert_eq!(mlp.fc1.weight.lazy_shape().as_slice(), &[8, 16]);
+    assert!(block.attn.qkv.bias_mask.is_some());
+    assert!(model.local_cls_norm.is_none());
+}
+
+#[test]
+fn legacy_burnpack_mlp_weights_load_with_the_documented_remap() {
+    use burn_dinov3::model::Mlp;
+    use burn_store::{BurnpackStore, ModuleSnapshot};
+
+    #[derive(Module, Debug)]
+    struct Layer<F: Module> {
+        mlp: F,
+    }
+
+    let device = Device::flex();
+    let old = Layer {
+        mlp: Mlp::new(8, 16, &device),
+    };
+    let mut store = BurnpackStore::from_bytes(None);
+    old.save_into(&mut store).unwrap();
+    let mut source = BurnpackStore::from_bytes(Some(store.get_bytes().unwrap()))
+        .with_remap_pattern(r"\bmlp\.(fc[12])\.", "mlp.Mlp.$1.");
+    let mut new = Layer {
+        mlp: FeedForward::Mlp(Mlp::new(8, 16, &device)),
+    };
+    let result = new.load_from(&mut source).unwrap();
+    assert!(result.unused.is_empty(), "{result}");
+    let x = Tensor::ones([1, 2, 8], &device);
+    assert_eq!(
+        new.mlp.forward(x.clone()).into_data(),
+        old.mlp.forward(x).into_data()
+    );
+}
