@@ -43,13 +43,19 @@ fn main() {
 
 Use `vit_small_plus`, `vit_large_plus`, or `vit_huge_plus` for S+, L+, or H+ weights. These checkpoints and `vit_7b` use SwiGLU. The generic `vit_huge2` constructor uses a GELU MLP. For the ViT-L/16 SAT493M checkpoint, set `with_untie_global_and_local_cls_norm(Some(true))` on the large model configuration. `forward_local` applies that checkpoint's local prefix norm on local training crops. [Upstream backbone configurations](https://github.com/facebookresearch/dinov3/blob/main/dinov3/hub/backbones.py)
 
-The built-in LoRA multiplier is `alpha / rank`. To reproduce a trained 0.1.7 adapter's previous multiplier, pass `old_alpha * rank / embed_dim` as its new alpha.
+## Loading a 0.1.7 checkpoint
 
-For a GELU model saved by 0.1.7 in Burnpack format, add `.with_remap_pattern(r"\bmlp\.(fc[12])\.", "mlp.Mlp.$1.")` to the store when loading. This maps the saved feed-forward weights into the GELU variant. For a 0.1.7 SafeTensors file, use `.skip_enum_variants(true)`.
+Load the original serialized `DinoVisionTransformerConfig` to recover the rounded feed-forward width used by 0.1.7. New configs use the upstream PyTorch width. For a built-in LoRA adapter, pass `old_alpha * rank / embed_dim` as its new alpha to preserve the old multiplier with `alpha / rank` scaling.
+
+For Burnpack, add `.with_remap_pattern(r"\bmlp\.(fc[12])\.", "mlp.Mlp.$1.")` to the store when loading. After `load_from`, call `model.deduplicate_lora_ids()` before training adapters and start with fresh adapter optimizer state. Version 0.1.7 assigned the same parameter IDs to adapters in different blocks. Burnpack restores those IDs along with their weights.
+
+For SafeTensors, use `.skip_enum_variants(true)`. This format uses the adapter IDs from the newly initialized model.
 
 # Tests
 
-Run `cargo test --locked` for the model tests. To compare every output token with the official PyTorch implementation, place the LVD1689M S/16, S+/16 and B/16 checkpoints in `models/`, make the upstream Python package available (a checkout in `dinov3/` works), and run `cargo test --locked --test checkpoints -- --ignored --nocapture`. The test uses the Flex CPU backend and `python3` by default. Set `BURN_DEVICE` to select a different enabled backend and `PYTHON` to select the Python executable with PyTorch and NumPy installed.
+Run `cargo test --locked` for the model tests. Tests and examples use the Flex CPU backend by default. Run `cargo run --locked --features cuda --example load` to load a checkpoint on CUDA, or use `--features metal` on macOS.
+
+To compare every output token with the official PyTorch implementation, place the LVD1689M S/16, S+/16 and B/16 checkpoints in `models/` and make the upstream Python package available (a checkout in `dinov3/` works). Run `cargo test --locked --test checkpoints -- --ignored --nocapture` on CPU, or `BURN_DEVICE=cuda cargo test --locked --features cuda --test checkpoints -- --ignored --nocapture` on CUDA. Set `PYTHON` to the Python executable with PyTorch and NumPy installed if it differs from `python3`.
 
 # Others
 

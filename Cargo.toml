@@ -9,14 +9,12 @@ documentation = "https://docs.rs/burn_dinov3"
 description = "DINOv3 with burn & Rust"
 keywords = ["dinov3", "dino", "burn", "vit"]
 
+[features]
+cuda = ["burn/cuda"]
+metal = ["burn/metal"]
+
 [dependencies]
 burn = "0.22.1"
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-burn = { version = "0.22.1", features = ["metal"] }
-
-[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
-burn = { version = "0.22.1", features = ["cuda"] }
 
 [dev-dependencies]
 burn = { version = "0.22.1", features = ["flex"] }

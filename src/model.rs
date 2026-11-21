@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use burn::{
     config::Config,
-    module::{Flag, Module, Param},
+    module::{Flag, Module, ModuleMapper, Param, ParamId},
     nn::{
         Dropout, DropoutConfig, Gelu, Initializer, LayerNorm, LayerNormConfig, Linear,
         conv::{Conv2d, Conv2dConfig},
@@ -353,6 +355,7 @@ pub enum FeedForward {
 
 impl FfnConfig {
     fn init(self, dim: usize, hidden: usize, device: &Device) -> FeedForward {
+        let hidden = if hidden == 0 { dim } else { hidden };
         match self {
             Self::Mlp => FeedForward::Mlp(Mlp::new(dim, hidden, device)),
             Self::SwiGlu { align_to } => {
@@ -381,7 +384,8 @@ pub struct BlockConfig {
     pub dim: usize,
     pub num_heads: usize,
     pub ffn_ratio: f64,
-    /// Defaults to the GELU MLP.
+    /// New configs use the upstream GELU MLP. An absent field preserves the 0.1.7 rounded width.
+    #[config(default = "Some(FfnConfig::Mlp)")]
     pub ffn_layer: Option<FfnConfig>,
     /// Defaults to a trained Q/V bias with the key bias masked.
     pub qkv_bias: Option<bool>,
@@ -399,7 +403,11 @@ pub struct Block<L: LoRALayer = LoRA> {
 
 impl BlockConfig {
     pub fn init<L: LoRALayer>(&self, lora: Option<L>, device: &Device) -> Block<L> {
-        let hidden = (self.dim as f64 * self.ffn_ratio) as usize;
+        let hidden = self.dim as f64 * self.ffn_ratio;
+        let mlp = match self.ffn_layer {
+            Some(layer) => layer.init(self.dim, hidden as usize, device),
+            None => FeedForward::Mlp(Mlp::new(self.dim, hidden.round() as usize, device)),
+        };
         Block {
             norm1: LayerNormConfig::new(self.dim).init(device),
             attn: AttentionConfig::new(self.dim, self.num_heads)
@@ -407,10 +415,7 @@ impl BlockConfig {
                 .init(lora, device),
             ls1: LayerScale::new(self.dim, 1e-5, device),
             norm2: LayerNormConfig::new(self.dim).init(device),
-            mlp: self
-                .ffn_layer
-                .unwrap_or(FfnConfig::Mlp)
-                .init(self.dim, hidden, device),
+            mlp,
             ls2: LayerScale::new(self.dim, 1e-5, device),
         }
     }
@@ -433,7 +438,8 @@ pub struct DinoVisionTransformerConfig {
     pub depth: usize,
     pub num_heads: usize,
     pub ffn_ratio: f64,
-    /// Defaults to the GELU MLP.
+    /// New configs use the upstream GELU MLP. An absent field preserves the 0.1.7 rounded width.
+    #[config(default = "Some(FfnConfig::Mlp)")]
     pub ffn_layer: Option<FfnConfig>,
     /// Defaults to a trained Q/V bias with the key bias masked.
     pub qkv_bias: Option<bool>,
@@ -482,7 +488,8 @@ impl DinoVisionTransformerConfig {
         DinoVisionTransformer {
             patch_embed: PatchEmbed::new(3, dim, self.patch_size, device),
             cls_token: self.initializer.init([1, 1, dim], device),
-            storage_tokens: (self.num_storage_tokens > 0).then(|| {
+            // A 0.1.7 checkpoint has this parameter even when its token axis is empty.
+            storage_tokens: (self.num_storage_tokens > 0 || self.ffn_layer.is_none()).then(|| {
                 self.initializer
                     .init([1, self.num_storage_tokens, dim], device)
             }),
@@ -520,7 +527,9 @@ impl<L: LoRALayer> DinoVisionTransformer<L> {
             cls = cls + self.mask_token.val().unsqueeze::<3>() * 0.0;
         }
         let mut tokens = vec![cls.expand([batch, 1, dim])];
-        if let Some(storage) = &self.storage_tokens {
+        if let Some(storage) = &self.storage_tokens
+            && storage.lazy_shape()[1] > 0
+        {
             tokens.push(storage.val().expand([batch as i64, -1, -1]));
         }
         tokens.push(patches);
@@ -572,6 +581,39 @@ impl<L: LoRALayer> DinoVisionTransformer<L> {
             )
         } else {
             self.norm.forward(x)
+        }
+    }
+
+    /// Give each block independent optimizer IDs after importing a 0.1.7 Burnpack.
+    /// Preserves tensor values, existing unique IDs, and ties within a custom adapter.
+    pub fn deduplicate_lora_ids(&mut self) {
+        struct AdapterIds {
+            block: usize,
+            seen: HashMap<ParamId, (usize, ParamId)>,
+        }
+
+        impl ModuleMapper for AdapterIds {
+            fn map_float<const D: usize>(
+                &mut self,
+                mut param: Param<Tensor<D>>,
+            ) -> Param<Tensor<D>> {
+                let (last_block, id) = self.seen.entry(param.id).or_insert((self.block, param.id));
+                if *last_block != self.block {
+                    *last_block = self.block;
+                    *id = ParamId::new();
+                }
+                param.id = *id;
+                param
+            }
+        }
+
+        let mut ids = AdapterIds {
+            block: 0,
+            seen: HashMap::new(),
+        };
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            ids.block = index;
+            block.attn.lora = block.attn.lora.take().map(|lora| lora.map(&mut ids));
         }
     }
 

@@ -200,53 +200,85 @@ fn rotary_grid_rescales_during_training_and_rotates_a_prefix_free_sequence() {
 }
 
 #[test]
-fn legacy_config_loads_the_original_mlp_architecture() {
-    use burn::config::Config;
+fn current_mlp_configs_preserve_upstream_widths_after_serialization() {
+    use burn::config::{Config, config_to_json};
 
-    let config = DinoVisionTransformerConfig::load_binary(
-        br#"{
-        "patch_size": 2, "embed_dim": 8, "num_storage_tokens": 0, "depth": 1,
-        "num_heads": 2, "ffn_ratio": 2.1, "lora": null,
-        "initializer": {"Normal": {"mean": 0.0, "std": 0.02}}
-    }"#,
-    )
-    .unwrap();
-    let model = config.init::<LoRA>(None, &Device::flex());
-    let block = &model.blocks[0];
-    let FeedForward::Mlp(mlp) = &block.mlp else {
-        panic!("expected GELU MLP")
-    };
-    assert_eq!(mlp.fc1.weight.lazy_shape().as_slice(), &[8, 16]);
-    assert!(block.attn.qkv.bias_mask.is_some());
-    assert!(model.local_cls_norm.is_none());
+    for (ratio, width) in [(2.1, 16), (0.1, 8)] {
+        let config = DinoVisionTransformerConfig::new(2, 8, 0, 1, 2, ratio);
+        let json = config_to_json(&config);
+        let config = DinoVisionTransformerConfig::load_binary(json.as_bytes()).unwrap();
+        let model = config.init::<LoRA>(None, &Device::flex());
+        assert!(model.storage_tokens.is_none());
+        let FeedForward::Mlp(mlp) = &model.blocks[0].mlp else {
+            panic!("expected GELU MLP")
+        };
+        assert_eq!(mlp.fc1.weight.lazy_shape().as_slice(), &[8, width]);
+        assert_eq!(mlp.fc2.weight.lazy_shape().as_slice(), &[width, 8]);
+    }
 }
 
 #[test]
-fn legacy_burnpack_mlp_weights_load_with_the_documented_remap() {
-    use burn_dinov3::model::Mlp;
+fn legacy_burnpack_restores_fractional_mlp_and_trains_each_adapter() {
+    use burn::{config::Config, optim::GradientsParams};
     use burn_store::{BurnpackStore, ModuleSnapshot};
 
-    #[derive(Module, Debug)]
-    struct Layer<F: Module> {
-        mlp: F,
-    }
-
-    let device = Device::flex();
-    let old = Layer {
-        mlp: Mlp::new(8, 16, &device),
-    };
-    let mut store = BurnpackStore::from_bytes(None);
-    old.save_into(&mut store).unwrap();
-    let mut source = BurnpackStore::from_bytes(Some(store.get_bytes().unwrap()))
-        .with_remap_pattern(r"\bmlp\.(fc[12])\.", "mlp.Mlp.$1.");
-    let mut new = Layer {
-        mlp: FeedForward::Mlp(Mlp::new(8, 16, &device)),
-    };
-    let result = new.load_from(&mut source).unwrap();
+    // Written by burn_dinov3 0.1.7 and burn-store 0.21 with a rank-2, alpha-4 all-ones adapter.
+    let config =
+        DinoVisionTransformerConfig::load_binary(include_bytes!("fixtures/model-0.1.7.json"))
+            .unwrap();
+    let device = Device::default().autodiff();
+    let mut model: DinoVisionTransformer = config.init(Some(LoRAConfig::new(2, 1.0)), &device);
+    let mut source = BurnpackStore::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/model-0.1.7.bpk"
+    ))
+    .with_remap_pattern(r"\bmlp\.(fc[12])\.", "mlp.Mlp.$1.");
+    let result = model.load_from(&mut source).unwrap();
     assert!(result.unused.is_empty(), "{result}");
-    let x = Tensor::ones([1, 2, 8], &device);
-    assert_eq!(
-        new.mlp.forward(x.clone()).into_data(),
-        old.mlp.forward(x).into_data()
-    );
+    assert_eq!(model.storage_tokens.as_ref().unwrap().dims(), [1, 0, 8]);
+    let FeedForward::Mlp(mlp) = &model.blocks[0].mlp else {
+        panic!("expected GELU MLP")
+    };
+    assert_eq!(mlp.fc1.weight.dims(), [8, 17]);
+    assert_eq!(mlp.fc2.weight.dims(), [17, 8]);
+    let mlp_id = mlp.fc1.weight.id;
+    let adapter_ids = |model: &DinoVisionTransformer| {
+        model
+            .blocks
+            .iter()
+            .map(|block| {
+                let lora = block.attn.lora.as_ref().unwrap();
+                [lora.a.id, lora.b_q.id, lora.b_v.id]
+            })
+            .collect::<Vec<_>>()
+    };
+    let original = adapter_ids(&model);
+    assert_eq!(original[0], original[1]);
+    model.deduplicate_lora_ids();
+    let migrated = adapter_ids(&model);
+    assert_eq!(migrated[0], original[0]);
+    model.deduplicate_lora_ids();
+    assert_eq!(adapter_ids(&model), migrated);
+    let FeedForward::Mlp(mlp) = &model.blocks[0].mlp else {
+        unreachable!()
+    };
+    assert_eq!(mlp.fc1.weight.id, mlp_id);
+    for block in &model.blocks {
+        let adapter = block.attn.lora.as_ref().unwrap();
+        for weight in [&adapter.a, &adapter.b_q, &adapter.b_v] {
+            assert_eq!(weight.to_data().try_into_vec::<f32>().unwrap(), [1.; 16]);
+        }
+    }
+    let model = model.no_grad_except_lora();
+    let x = Tensor::arange(0..72, &device).float().reshape([1, 3, 4, 6]);
+    let grads = model
+        .forward_cls(x, None)
+        .select_dim::<1>(1, 0)
+        .sum()
+        .backward();
+    let grads = GradientsParams::from_grads(grads, &model);
+    assert_eq!(grads.len(), 6);
+    for id in migrated.iter().flatten() {
+        assert!(grads.get::<2>(*id).is_some());
+    }
 }
