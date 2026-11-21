@@ -1,0 +1,15 @@
+{
+  "patch_size": 2,
+  "embed_dim": 8,
+  "num_storage_tokens": 0,
+  "depth": 2,
+  "num_heads": 2,
+  "ffn_ratio": 2.1,
+  "lora": null,
+  "initializer": {
+    "Normal": {
+      "mean": 0.0,
+      "std": 0.02
+    }
+  }
+}
